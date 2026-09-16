@@ -1,0 +1,52 @@
+diff --git a/python/sglang/kernels/ops/quantization/gptq_triton.py b/python/sglang/kernels/ops/quantization/gptq_triton.py
+index f82ce87feb..ae18e70464 100644
+--- a/python/sglang/kernels/ops/quantization/gptq_triton.py
++++ b/python/sglang/kernels/ops/quantization/gptq_triton.py
+@@ -20,16 +20,31 @@ GPTQ_TRITON_SUPPORTED_GROUP_SIZES = {-1, 32, 64, 128, 256}
+ 
+ # Offline-tuned on Radeon 8060S (gfx1151), ROCm 7.2.4, Triton 3.5.1.
+ # Key: (M bucket, K, N), value: (BLOCK_M, BLOCK_N, BLOCK_K, warps, stages).
++#
++# Entries marked "Qwen3.8" were added/corrected by /workspace/tune_w4a16.py and
++# confirmed by /workspace/verify_w4a16.py, which interleaves baseline and
++# candidate within one pass and takes the median ratio over 7 repeats.
++# Separate-pass timing on this box drifts ~8%, which is enough to invent
++# speedups that do not exist, so nothing below ~1.08x was adopted.
++#
++# The shapes were read off a LIVE server (instrumented gptq_w4a16_skinny_gemm)
++# rather than derived from config.json -- a derivation of the qkv shape gave
++# (5120, 8192), which this model never executes. m=8 is DFLASH's decode block
++# (8 draft tokens x batch 1); m=16 is batch 2. Per decode step the call mix is
++# o_proj/gate_up/down x4, gdn_qkvz/gdn_ba x3, attn_qkv x1.
++#
++# (5120, 96) is deliberately absent: every candidate tried was SLOWER than the
++# generic heuristic there (0.86x at m=8), and at 0.04 ms it is not worth more.
+ _GFX1151_W4A16_CONFIGS = {
+-    (8, 5120, 16384): (16, 64, 128, 4, 1),
+-    (8, 17408, 5120): (16, 32, 128, 2, 1),
++    (8, 5120, 16384): (16, 32, 128, 2, 2),  # Qwen3.8 gdn_qkvz   1.09x
++    (8, 17408, 5120): (8, 32, 128, 2, 1),  # Qwen3.8 down_proj  1.08x
+     (12, 5120, 16384): (16, 64, 128, 4, 1),
+     (12, 5120, 14336): (32, 16, 128, 2, 1),
+     (12, 5120, 34816): (16, 32, 128, 2, 1),
+     (12, 17408, 5120): (16, 32, 128, 2, 1),
+-    (16, 5120, 16384): (16, 64, 128, 4, 1),
++    (16, 5120, 16384): (16, 64, 128, 4, 2),  # Qwen3.8 gdn_qkvz   1.16x
+     (16, 5120, 34816): (16, 32, 128, 2, 1),
+-    (16, 17408, 5120): (16, 32, 128, 2, 1),
++    (16, 17408, 5120): (16, 32, 128, 2, 2),  # Qwen3.8 down_proj  1.11x
+     (64, 5120, 16384): (64, 32, 128, 4, 1),
+     (64, 5120, 96): (128, 64, 64, 8, 2),
+     (64, 6144, 5120): (128, 32, 128, 4, 1),
+@@ -55,6 +70,11 @@ _GFX1151_W4A16_CONFIGS = {
+     (4096, 5120, 96): (64, 128, 32, 4, 3),
+     (4096, 5120, 14336): (128, 256, 32, 8, 2),
+     (4096, 5120, 34816): (128, 256, 32, 8, 2),
++    (8, 5120, 14336): (16, 64, 128, 4, 2),  # Qwen3.8 attn_qkv   1.35x new
++    (8, 6144, 5120): (16, 64, 128, 4, 2),  # Qwen3.8 o_proj     1.20x new
++    (8, 5120, 34816): (16, 32, 128, 2, 2),  # Qwen3.8 gate_up    1.35x new
++    (16, 5120, 14336): (16, 64, 128, 4, 2),  # Qwen3.8 attn_qkv   1.36x new
++    (16, 6144, 5120): (16, 32, 128, 2, 2),  # Qwen3.8 o_proj     1.34x new
+ }
+ 
+ 

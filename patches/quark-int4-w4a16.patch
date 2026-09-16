@@ -1,0 +1,288 @@
+diff --git a/python/sglang/kernels/ops/quantization/awq_triton.py b/python/sglang/kernels/ops/quantization/awq_triton.py
+index b83dd79fbc..9531e3f89b 100644
+--- a/python/sglang/kernels/ops/quantization/awq_triton.py
++++ b/python/sglang/kernels/ops/quantization/awq_triton.py
+@@ -133,7 +133,10 @@ def awq_gemm_kernel(
+     pid_m = pid // num_pid_n
+     pid_n = pid % num_pid_n
+ 
+-    accumulator_dtype = c_ptr.type.element_ty
++    # tl.dot refuses to accumulate in bf16; accumulate in fp32 and cast on store.
++    accumulator_dtype = (
++        tl.float32 if c_ptr.type.element_ty == tl.bfloat16 else c_ptr.type.element_ty
++    )
+ 
+     # NOTE: This doesn't work in TRITON_INTERPRET=1 mode.  Use below instead.
+     # accumulator = tl.arange(0, BLOCK_SIZE_N)
+diff --git a/python/sglang/srt/layers/quantization/quark/quark.py b/python/sglang/srt/layers/quantization/quark/quark.py
+index c37101056c..b8dd16f51d 100644
+--- a/python/sglang/srt/layers/quantization/quark/quark.py
++++ b/python/sglang/srt/layers/quantization/quark/quark.py
+@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
+     QuarkLinearScheme,
+     QuarkMoEScheme,
+     QuarkW4A4MXFP4,
++    QuarkW4A16Int4,
+     QuarkW4A4MXFp4MoE,
+     QuarkW4A8MXFp4MoE,
+     QuarkW8A8Fp8,
+@@ -709,6 +710,42 @@ class QuarkConfig(QuantizationConfig):
+         is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
+         return is_per_tensor_activation
+ 
++    def _is_int4_w4a16(
++        self,
++        weight_quant: Optional[dict[str, Any]],
++        input_quant: Optional[dict[str, Any]],
++    ) -> bool:
++        # Weight-only: activations stay in their original precision.
++        if weight_quant is None or input_quant is not None:
++            return False
++
++        if weight_quant.get("dtype") != "int4":
++            logger.debug("Quark model is not in int4 W4A16 format: dtype not int4")
++            return False
++
++        if weight_quant.get("qscheme") != "per_group":
++            logger.debug("Quark model is not in int4 W4A16 format: not per_group")
++            return False
++
++        # The AWQ packing the kernels expect is 8 int4 per int32 along the
++        # output dim, with one scale per `group_size` inputs.
++        from sglang.kernels.ops.quantization.awq_triton import (
++            AWQ_TRITON_SUPPORTED_GROUP_SIZES,
++        )
++
++        if weight_quant.get("group_size") not in AWQ_TRITON_SUPPORTED_GROUP_SIZES:
++            logger.debug(
++                "Quark model is not in int4 W4A16 format: unsupported group_size %s",
++                weight_quant.get("group_size"),
++            )
++            return False
++
++        if weight_quant.get("is_dynamic") is True:
++            logger.debug("Quark model is not in int4 W4A16 format: not weight static")
++            return False
++
++        return True
++
+     def _is_mx_fp4(
+         self,
+         weight_quant: Optional[dict[str, Any]],
+@@ -844,6 +881,8 @@ class QuarkConfig(QuantizationConfig):
+                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
+                 dequantization_config=self.dequantization_config,
+             )
++        if self._is_int4_w4a16(weight_config, input_config):
++            return QuarkW4A16Int4(weight_config, input_config)
+         if self._is_fp8_w8a8(weight_config, input_config):
+             is_fp8_w8a8_supported = self._check_scheme_supported(
+                 QuarkW8A8Fp8.get_min_capability(), error=False
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/__init__.py b/python/sglang/srt/layers/quantization/quark/schemes/__init__.py
+index cbc2dc2768..414e64bf58 100644
+--- a/python/sglang/srt/layers/quantization/quark/schemes/__init__.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/__init__.py
+@@ -3,6 +3,7 @@
+ from .quark_scheme import QuarkLinearScheme, QuarkMoEScheme
+ from .quark_w4a4_mxfp4 import QuarkW4A4MXFP4
+ from .quark_w4a4_mxfp4_moe import QuarkW4A4MXFp4MoE
++from .quark_w4a16_int4 import QuarkW4A16Int4
+ from .quark_w4a8_mxfp4_moe import QuarkW4A8MXFp4MoE
+ from .quark_w8a8_fp8 import QuarkW8A8Fp8
+ from .quark_w8a8_fp8_moe import QuarkW8A8FP8MoE
+@@ -11,6 +12,7 @@ __all__ = [
+     "QuarkLinearScheme",
+     "QuarkMoEScheme",
+     "QuarkW4A4MXFP4",
++    "QuarkW4A16Int4",
+     "QuarkW8A8Fp8",
+     "QuarkW4A4MXFp4MoE",
+     "QuarkW4A8MXFp4MoE",
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index d3691ea5ec..ddfac1e5c9 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -535,6 +535,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             # One logical scale per logical shard.
+             return [1 for _ in loaded_shard_id]
+ 
++        packed_dim = getattr(param, "packed_dim", None)
++        if packed_dim is not None and packed_dim == getattr(param, "output_dim", None):
++            # int4 checkpoints (AWQ/Quark) pack several values per int32 along
++            # the output dim, so the checkpoint-side splits are in packed units.
++            packed_factor = param.packed_factor
++            return [
++                module.output_sizes[idx] // packed_factor for idx in loaded_shard_id
++            ]
++
+         # Normal weight / non-block quant tensor
+         return [module.output_sizes[idx] for idx in loaded_shard_id]
+ 
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a16_int4.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a16_int4.py
+new file mode 100644
+index 0000000000..91823cad42
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a16_int4.py
+@@ -0,0 +1,162 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from typing import Any, Callable, Optional
++
++import torch
++from torch.nn import Parameter
++
++from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
++from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
++from sglang.srt.utils import is_hip
++
++__all__ = ["QuarkW4A16Int4"]
++
++# Per-nibble +8 (mod 16), i.e. signed int4 -> unsigned int4 with a +8 bias.
++_INT4_SIGN_FLIP = -2004318072  # 0x88888888 as a signed int32
++
++# Rows up to which the fused int4 GEMM beats dequantize-to-bf16 + hipBLAS GEMM.
++# Measured on gfx1151 (5120x17408): ~2.9x at M<=16, 1.13x at M=256, and it
++# falls behind from M~2048 (prefill), where the dense GEMM is compute-bound.
++_FUSED_GEMM_MAX_ROWS = 256
++
++
++class QuarkW4A16Int4(QuarkLinearScheme):
++    """Weight-only int4 per-group (W4A16), as produced by Quark's AWQ exporter.
++
++    The checkpoint layout is AWQ's: 8 int4 values packed per int32 along the
++    output dim, in AWQ's interleaved nibble order, with a bf16 per-group scale.
++    The only difference is that Quark stores *signed* int4 codes against an
++    all-zero zero-point, where AWQ stores unsigned codes against a zero-point
++    of 8. Since dequantization is ``(w - zp) * scale`` in both, adding 8 to
++    every nibble of both tensors is lossless and lets us reuse the AWQ kernels.
++    """
++
++    def __init__(
++        self, weight_config: dict[str, Any], input_config: Optional[dict[str, Any]]
++    ):
++        from sglang.kernels.ops.quantization.awq_triton import (
++            AWQ_TRITON_SUPPORTED_GROUP_SIZES,
++        )
++
++        self.group_size = weight_config.get("group_size")
++        self.pack_factor = 8
++        self.out_dtype = torch.get_default_dtype()
++        # ROCm has no native AWQ GEMM, so the shared AWQ path dequantizes the
++        # whole weight to bf16 on every forward -- more memory traffic than the
++        # unquantized model. Use the fused triton int4 GEMM for the small-M
++        # (decode) shapes instead, where it is ~3x faster.
++        self.use_fused_gemm = (
++            is_hip() and self.group_size in AWQ_TRITON_SUPPORTED_GROUP_SIZES
++        )
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        # Turing and up (same as AWQ); on ROCm the triton kernel is used.
++        return 75
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        output_partition_sizes: list[int],
++        input_size_per_partition: int,
++        params_dtype: torch.dtype,
++        weight_loader: Callable,
++        **kwargs,
++    ):
++        output_size_per_partition = sum(output_partition_sizes)
++
++        if input_size_per_partition % self.group_size != 0:
++            raise ValueError(
++                f"Input size {input_size_per_partition} is not divisible by "
++                f"group size {self.group_size}. This can be caused by too "
++                "large a tensor parallel size."
++            )
++        if output_size_per_partition % self.pack_factor != 0:
++            raise ValueError(
++                f"Output size {output_size_per_partition} is not divisible by "
++                f"the int4 pack factor {self.pack_factor}. This can be caused "
++                "by too large a tensor parallel size."
++            )
++
++        layer.logical_widths = output_partition_sizes
++
++        weight = PackedvLLMParameter(
++            data=torch.empty(
++                input_size_per_partition,
++                output_size_per_partition // self.pack_factor,
++                dtype=torch.int32,
++            ),
++            input_dim=0,
++            output_dim=1,
++            packed_dim=1,
++            packed_factor=self.pack_factor,
++            weight_loader=weight_loader,
++        )
++        weight_zero_point = PackedvLLMParameter(
++            data=torch.empty(
++                input_size_per_partition // self.group_size,
++                output_size_per_partition // self.pack_factor,
++                dtype=torch.int32,
++            ),
++            input_dim=0,
++            output_dim=1,
++            packed_dim=1,
++            packed_factor=self.pack_factor,
++            weight_loader=weight_loader,
++        )
++        weight_scale = GroupQuantScaleParameter(
++            data=torch.empty(
++                input_size_per_partition // self.group_size,
++                output_size_per_partition,
++                dtype=params_dtype,
++            ),
++            input_dim=0,
++            output_dim=1,
++            weight_loader=weight_loader,
++        )
++
++        layer.register_parameter("weight", weight)
++        layer.register_parameter("weight_zero_point", weight_zero_point)
++        layer.register_parameter("weight_scale", weight_scale)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        flip = torch.tensor(
++            _INT4_SIGN_FLIP, dtype=torch.int32, device=layer.weight.device
++        )
++        layer.weight = Parameter(
++            torch.bitwise_xor(layer.weight.data, flip), requires_grad=False
++        )
++        layer.weight_zero_point = Parameter(
++            torch.bitwise_xor(layer.weight_zero_point.data, flip), requires_grad=False
++        )
++        layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
++
++    def apply_weights(
++        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
++    ) -> torch.Tensor:
++        from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
++            awq_dequantize,
++        )
++
++        out_shape = x.shape[:-1] + (layer.weight.shape[-1] * self.pack_factor,)
++        reshaped_x = x.reshape(-1, x.shape[-1])
++
++        if reshaped_x.shape[0] <= _FUSED_GEMM_MAX_ROWS and self.use_fused_gemm:
++            from sglang.kernels.ops.quantization.awq_triton import awq_gemm_triton
++
++            out = awq_gemm_triton(
++                reshaped_x,
++                layer.weight,
++                layer.weight_scale,
++                layer.weight_zero_point,
++                split_k_iters=1,
++            )
++        else:
++            weight = awq_dequantize(
++                layer.weight, layer.weight_scale, layer.weight_zero_point
++            )
++            out = torch.matmul(reshaped_x, weight)
++
++        if bias is not None:
++            out.add_(bias)
++        return out.reshape(out_shape)

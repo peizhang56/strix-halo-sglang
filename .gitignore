@@ -1,0 +1,13 @@
+# Server logs
+*.log
+logs/
+
+# JIT kernel caches pinned here by sglang_server.sh
+# (TORCHINDUCTOR_CACHE_DIR / TRITON_CACHE_DIR). Large, machine-specific,
+# regenerated on demand — never commit.
+.cache/
+
+# Corporate CA certificates — never publish
+*.crt
+*.cer
+*.pem
