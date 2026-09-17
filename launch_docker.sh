@@ -12,6 +12,10 @@ NAME=sglang-dev
 IMAGE=rocm/sgl-dev:v0.5.19-rocm724-gfx1151-20260914
 HF_CACHE="$HOME/.cache/huggingface"
 HOST_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+# Where HOST_DIR shows up inside the container. Nothing in the repo's scripts
+# depends on this value -- they all resolve paths relative to themselves -- so it
+# is a plain default, not a contract.
+MOUNT_DIR="${SGLANG_MOUNT_DIR:-/workspace}"
 PORT=30000
 RECREATE=0
 
@@ -21,7 +25,8 @@ Usage: ./launch_docker.sh [options]
   --name NAME        container name   (default: $NAME)
   --image IMAGE      docker image     (default: $IMAGE)
   --hf-cache PATH    HF model cache   (default: \$HOME/.cache/huggingface)
-  --host-dir PATH    mounted at /workspace (default: git root of cwd)
+  --host-dir PATH    host dir to mount (default: git root of cwd)
+  --mount-dir PATH   where it appears in the container (default: $MOUNT_DIR)
   --port PORT        published port   (default: $PORT)
   --recreate         remove an existing container of the same name first
 EOF
@@ -33,6 +38,7 @@ while [ $# -gt 0 ]; do
     --image)    IMAGE=$2; shift 2 ;;
     --hf-cache) HF_CACHE=$2; shift 2 ;;
     --host-dir) HOST_DIR=$2; shift 2 ;;
+    --mount-dir) MOUNT_DIR=$2; shift 2 ;;
     --port)     PORT=$2; shift 2 ;;
     --recreate) RECREATE=1; shift ;;
     -h|--help)  usage; exit 0 ;;
@@ -80,8 +86,8 @@ docker run -d --name "$NAME" \
   -e REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -v "$HF_CACHE:/root/.cache/huggingface" \
-  -v "$HOST_DIR:/workspace" \
-  -w /workspace \
+  -v "$HOST_DIR:$MOUNT_DIR" \
+  -w "$MOUNT_DIR" \
   "$IMAGE" sleep infinity >/dev/null
 
 if [ -d "$HOST_CA_DIR" ] && [ -n "$(ls -A "$HOST_CA_DIR" 2>/dev/null)" ]; then
@@ -91,7 +97,7 @@ if [ -d "$HOST_CA_DIR" ] && [ -n "$(ls -A "$HOST_CA_DIR" 2>/dev/null)" ]; then
 fi
 
 echo "Started '$NAME' ($IMAGE)"
-echo "  /workspace -> $HOST_DIR"
+echo "  $MOUNT_DIR -> $HOST_DIR"
 echo "  hf cache   -> $HF_CACHE"
 echo "  port       -> $PORT"
 echo "Exec: docker exec -it $NAME bash"

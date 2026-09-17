@@ -21,8 +21,8 @@ GPTQ_TRITON_SUPPORTED_GROUP_SIZES = {-1, 32, 64, 128, 256}
 # Offline-tuned on Radeon 8060S (gfx1151), ROCm 7.2.4, Triton 3.5.1.
 # Key: (M bucket, K, N), value: (BLOCK_M, BLOCK_N, BLOCK_K, warps, stages).
 #
-# Entries marked "Qwen3.8" were added/corrected by /workspace/tune_w4a16.py and
-# confirmed by /workspace/verify_w4a16.py, which interleaves baseline and
+# Entries marked "Qwen3.8" were added/corrected by tune_w4a16.py and
+# confirmed by verify_w4a16.py, which interleaves baseline and
 # candidate within one pass and takes the median ratio over 7 repeats.
 # Separate-pass timing on this box drifts ~8%, which is enough to invent
 # speedups that do not exist, so nothing below ~1.08x was adopted.

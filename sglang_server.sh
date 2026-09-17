@@ -59,10 +59,13 @@ PY
 export HF_HUB_OFFLINE=1
 
 # The first forward pass JIT-compiles Triton/inductor kernels. The default cache
-# dirs live in the container's /tmp, so every launch recompiled from scratch;
-# /workspace is one of the two persistent mounts, so keep them there instead.
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/workspace/.cache/inductor}"
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/workspace/.cache/triton}"
+# dirs live in the container's /tmp, so every launch recompiled from scratch. This
+# repo is a bind mount from the host, so keep the caches beside the script instead
+# -- .gitignore already excludes .cache/. Override SGLANG_CACHE_DIR (or either
+# TORCH*/TRITON* variable directly) to put them elsewhere.
+CACHE_DIR="${SGLANG_CACHE_DIR:-${SCRIPT_DIR}/.cache}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${CACHE_DIR}/inductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${CACHE_DIR}/triton}"
 
 # SGLang warms up with one generate request and kills the whole server if it does
 # not answer within 600 s. A cold-compile launch here can exceed that, so raise it.
@@ -94,12 +97,10 @@ MEM_FRACTION="${SGLANG_MEM_FRACTION:-0.93}"
 # which the client reports as a transient server fault. The patched copy collapses all six
 # levels onto the three the model knows instead of raising. Use SGLANG_CHAT_TEMPLATE= (set
 # but empty) to fall back to the stock template, or point it at another file.
-# launch_docker.sh mounts this repo at /workspace. When the scripts live
-# elsewhere (e.g. /sgl-workspace/strix-halo-sglang), fall back to SCRIPT_DIR.
+# The template ships beside this script, so resolve it from SCRIPT_DIR -- that works
+# wherever the repo is checked out or mounted.
 if [ -n "${SGLANG_CHAT_TEMPLATE+x}" ]; then
     CHAT_TEMPLATE="${SGLANG_CHAT_TEMPLATE}"
-elif [ -f /workspace/chat_template_qwen3_agentic.jinja ]; then
-    CHAT_TEMPLATE="/workspace/chat_template_qwen3_agentic.jinja"
 else
     CHAT_TEMPLATE="${SCRIPT_DIR}/chat_template_qwen3_agentic.jinja"
 fi

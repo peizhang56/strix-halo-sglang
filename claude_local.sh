@@ -8,10 +8,15 @@
 #
 # Run it from a normal shell, not from inside an existing Claude Code session.
 #
+# Tool calls run WITHOUT permission prompts (IS_SANDBOX=1 + --dangerously-skip-permissions)
+# so the agent loop does not stall on a human; see the block above the exec for why that is
+# acceptable in this container and how to turn it off.
+#
 #   ./claude_local.sh                       # interactive session on the local model
 #   ./claude_local.sh -p 'say hi'           # one-shot, good for a first smoke test
 #   CLAUDE_LOCAL_MODEL=... ./claude_local.sh
 #   SGLANG_HOST=localhost ./claude_local.sh # from the host, port 30000 is published
+#   CLAUDE_LOCAL_SKIP_PERMISSIONS=0 ./claude_local.sh   # ask before each tool call
 set -euo pipefail
 
 HOSTNAME_="${SGLANG_HOST:-127.0.0.1}"
@@ -199,7 +204,33 @@ else
     tool_flags=(--disallowed-tools "$DROP_TOOLS")
 fi
 
-echo "Claude Code -> ${BASE} (model: ${MODEL}, effort: ${EFFORT}, tools: ${CLAUDE_LOCAL_TOOLS:-lean})"
+# --- permission prompts -------------------------------------------------------------
+# --dangerously-skip-permissions runs every tool call without asking. That is the point
+# for an agentic demo on this box: a permission prompt stalls the loop waiting on a human,
+# and the whole exercise is watching the local model drive the tools unattended.
+#
+# IS_SANDBOX=1 is REQUIRED, not decorative. Claude Code refuses --dangerously-skip-
+# permissions when running as root (which we are, in this container) unless IS_SANDBOX is
+# set -- the check exists so nobody arms it on a workstation by accident. It has to be in
+# the PROCESS environment, so it is exported here rather than put in the settings `env`
+# block: the flag is read at startup, before settings are resolved.
+#
+# The safety argument here is the container, not the flag: the repo bind mount and the HF
+# cache are the only persistent mounts, there is no docker socket inside, and the model is
+# local, so
+# a bad tool call cannot reach the host or the network. Do NOT carry this invocation to a
+# session that is not this container.
+#
+#   CLAUDE_LOCAL_SKIP_PERMISSIONS=0 ./claude_local.sh   # restore normal prompting
+SKIP_PERMS="${CLAUDE_LOCAL_SKIP_PERMISSIONS:-1}"
+perm_flags=()
+if [ "$SKIP_PERMS" = "1" ]; then
+    export IS_SANDBOX=1
+    perm_flags=(--dangerously-skip-permissions)
+fi
+
+echo "Claude Code -> ${BASE} (model: ${MODEL}, effort: ${EFFORT}, tools: ${CLAUDE_LOCAL_TOOLS:-lean}, skip-permissions: ${SKIP_PERMS})"
 # --effort and the tool list go before "$@" so an explicit one from the caller still wins.
 exec claude --settings "$SETTINGS" --effort "$EFFORT" \
+     ${perm_flags[@]+"${perm_flags[@]}"} \
      ${tool_flags[@]+"${tool_flags[@]}"} "$@"
