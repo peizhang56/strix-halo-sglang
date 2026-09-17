@@ -9,8 +9,8 @@ This repo is self-contained: everything below runs from the scripts in here.
 | script | where it runs | what it does |
 |---|---|---|
 | `launch_docker.sh` | WSL host | starts the ROCm/SGLang container, mounts this repo at `/workspace` |
-| `patches/apply.sh` | container | applies the int4 + GEMM-tuning patches to the image's SGLang |
-| `sglang_server.sh` | container | starts the model server |
+| `patches/apply.sh` | container | clones `gfx1151_optim` to `/sgl-workspace/sglang-gfx1151` and rebuilds AOT kernels there (does **not** touch the image tree) |
+| `sglang_server.sh` | container | starts the model server (DFlash2 / step-7 stack by default) |
 | `stop.sh` | container | stops it (**always use this**, not `pkill`) |
 | `claude_local.sh` | container | starts Claude Code against that server |
 | `chat_template_qwen3_agentic.jinja` | — | patched chat template, load-bearing (see [Traps](#traps)) |
@@ -30,9 +30,9 @@ If the machine is already set up, the whole demo is five commands:
 ./launch_docker.sh && docker exec -it sglang-dev bash
 
 # container
-./patches/apply.sh                                  # after every launch_docker.sh
-SGLANG_SPEC=dflash ./sglang_server.sh 2>&1 | tee server.log   # terminal 1
-./claude_local.sh                                   # terminal 2, once /health is 200
+./patches/apply.sh                    # clone gfx1151_optim + rebuild kernels (after every launch_docker.sh)
+./sglang_server.sh 2>&1 | tee server.log   # terminal 1; DFlash2 / step 7 is the default
+./claude_local.sh                     # terminal 2, once /health is 200
 ```
 
 Everything else on this page is the one-time setup behind those five lines.
@@ -220,22 +220,27 @@ python3 -c 'import torch; print(torch.cuda.is_available(), torch.cuda.get_device
 
 ### 5.1 One-time setup inside the container
 
-**Re-run after every `launch_docker.sh`.** These edits live in `/sgl-workspace/sglang`,
-which is inside the image, so a recreated container loses them.
+**Re-run after every `launch_docker.sh`.** The clone lives under `/sgl-workspace`, which
+is inside the image, so a recreated container loses it.
 
 ```bash
 cd /workspace
 ./patches/apply.sh
 ```
 
-That applies two patches, both idempotent:
+That clones [hubertlu-tw/sglang@gfx1151_optim](https://github.com/hubertlu-tw/sglang/tree/gfx1151_optim)
+to `/sgl-workspace/sglang-gfx1151` (it will refuse to overwrite `/sgl-workspace/sglang`),
+rebuilds AOT kernels in the clone with `AMDGPU_TARGET=gfx1151 python3 setup_rocm.py build_ext --inplace`,
+and checks that `sglang.__file__` and `sgl_kernel.__file__` both contain `sglang-gfx1151`
+and that `wvSplitK` / `wvSplitK_int4_g` exist.
 
-- `quark-int4-w4a16.patch` — the W4A16 scheme the int4 checkpoint needs. Without it the
-  default model will not load.
-- `0001-gfx1151-w4a16-qwen38-configs.patch` — 14 missing Triton GEMM configs for
-  Qwen3.8-27B's shapes. Worth **+16% decode**, bit-identical output. SGLang's shipped
-  gfx1151 table was tuned for a different model and this one's `qkv_proj` was missing at
-  every M bucket, falling through to a generic heuristic.
+Do **not** `pip install --force-reinstall` the new wheel into site-packages: that replaces
+the image kernels for every process. `sglang_server.sh` puts
+`.../sglang-gfx1151/python/sglang/kernels/aot/python` then `.../sglang-gfx1151/python`
+first on `PYTHONPATH` instead.
+
+Set `SGLANG_REBUILD_KERNELS=1` to force a kernel rebuild if the clone is already present.
+The in-repo `*.patch` files are superseded by this branch and are not applied.
 
 Install Claude Code (also lost on recreate):
 
@@ -258,7 +263,7 @@ Terminal 1, inside the container:
 
 ```bash
 cd /workspace
-SGLANG_SPEC=dflash ./sglang_server.sh 2>&1 | tee server.log
+./sglang_server.sh 2>&1 | tee server.log
 ```
 
 Keep the `tee` — the script logs to stdout only, and `server.log` is where you read cache
@@ -284,8 +289,10 @@ Stop with `./stop.sh` — see [Traps](#traps) for why never `pkill`.
 
 ### Which decoder
 
-`SGLANG_SPEC=eagle|dflash|none`. **Prefer `dflash`** for agentic work — it is faster on
-every end-to-end measurement:
+`SGLANG_SPEC=dflash|eagle|none`. Default is **`dflash`** (gfx1151_optim step 7).
+That stack is Quark W4A16 + DFlash2 + `wvSplitK` + grouped GDN `fwd_o` +
+row-streaming GDN decode. GSM8K 10q `--parallel 10` measured **15.991 output tok/s**
+at accuracy 1.000. Use `SGLANG_SPEC=eagle` for MTP, or `SGLANG_SPEC=none` to bisect.
 
 | | EAGLE/MTP | **DFLASH** |
 |---|---|---|
@@ -303,16 +310,18 @@ checkpoint leaves dense BF16.
 
 ### The resolved command
 
-For reference; `sglang_server.sh` builds this:
+For reference; `sglang_server.sh` builds this (PYTHONPATH points at the clone, not
+the image tree):
 
 ```bash
+export PYTHONPATH=/sgl-workspace/sglang-gfx1151/python/sglang/kernels/aot/python:/sgl-workspace/sglang-gfx1151/python
 python3 -m sglang.launch_server \
     --model-path amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16 \
     --attention-backend triton \
     --host 0.0.0.0 --port 30000 \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static 0.93 \
     --context-length 65536 \
-    --chunked-prefill-size 1024 \
+    --chunked-prefill-size 4096 \
     --max-running-requests 4 \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_coder \
@@ -326,22 +335,20 @@ python3 -m sglang.launch_server \
 Five of those should not be changed casually:
 
 - **`--attention-backend triton`** — AITER targets CDNA, not gfx1151.
-- **`--mem-fraction-static 0.85`** — **do not raise to 0.93.** It hung the whole host, hard
-  restart required. The ~103 GB of GTT is carved out of the same physical RAM the host is
-  using, so 0.93 asks for ~96 GB of a pool that mostly isn't there and WSL2 wedges. The trap
-  is that it doesn't fail every time — one 0.93 server ran clean and scored GSM8K 1.000 six
-  times. A single clean run is not evidence that it is safe.
-- **`--chunked-prefill-size 1024`** — worth **3.7× on prefill** (43.9 → 163.1 tok/s at 8k).
-  Above 256 rows the W4A16 path has no ROCm AWQ GEMM and dequantizes the whole weight to
-  bf16 per layer per forward; a 1024-row chunk keeps that tile resident, an 8192-row chunk
-  does not. The optimum is sharp (512 is worse) and specific to this quantization.
+- **`--mem-fraction-static 0.93`** — this is the step-7 GSM8K setting. It has hung this
+  WSL2 host before (GTT is carved out of the same physical RAM). If the box wedges, relaunch
+  with `SGLANG_MEM_FRACTION=0.85`. A single clean 0.93 run is not evidence that it is always
+  safe.
+- **`--chunked-prefill-size 4096`** — step 7 used this with `wvSplitK`. The older 1024
+  optimum was for the pre-wvSplitK dequant-to-bf16 GEMM path. Reproduce that baseline with
+  `SGLANG_CHUNKED_PREFILL=1024`.
 - **`--speculative-num-draft-tokens 8`** — must equal the drafter's `block_size`. SGLang
   errors if they disagree, and defaults to 16 if it cannot read the config.
 - **`--chat-template`** — carries two required patches. See traps 3 and 5.
 
-Useful overrides: `SGLANG_CONTEXT_LEN` (65536), `SGLANG_MEM_FRACTION` (0.85),
-`SGLANG_MAX_RUNNING` (4), `SGLANG_CHUNKED_PREFILL` (1024), `SGLANG_NO_SPEC=1` for the
-conservative no-graph path, and `./sglang_server.sh Qwen/Qwen3.8-27B` for bf16 weights.
+Useful overrides: `SGLANG_CONTEXT_LEN` (65536), `SGLANG_MEM_FRACTION` (0.93),
+`SGLANG_MAX_RUNNING` (4), `SGLANG_CHUNKED_PREFILL` (4096), `SGLANG_SPEC=eagle` or
+`SGLANG_NO_SPEC=1`, and `./sglang_server.sh Qwen/Qwen3.8-27B` for bf16 weights.
 
 ### Smoke test
 
@@ -430,7 +437,7 @@ Rough timings for a hackathon slot. Do steps 1–2 **before** the audience arriv
 | | step | time |
 |---|---|---|
 | 1 | `./launch_docker.sh && docker exec -it sglang-dev bash` | ~10 s |
-| 2 | `./patches/apply.sh` then `SGLANG_SPEC=dflash ./sglang_server.sh 2>&1 \| tee server.log` | 3–9 min |
+| 2 | `./patches/apply.sh` then `./sglang_server.sh 2>&1 \| tee server.log` | 3–9 min (longer on first kernel build) |
 | 3 | poll `/health` until 200 | — |
 | 4 | `./claude_local.sh -p 'Reply: LOCAL OK'` + prefill-count check | ~1 min |
 | 5 | `./claude_local.sh`, ask it to read and edit a file in `/workspace` | ~1 min/turn |
@@ -562,7 +569,7 @@ These are upstream `/v1/messages` issues — check them before blaming local con
   15.4 GB still free. The pool is sized from `--mem-fraction-static`, not from the context
   length, so raising context costs nothing until a request actually uses it. Model max is
   262144.
-- **`launch_server_temp_dflash.sh`-style configs are wrong for this box.** If you find one
-  floating around with `--mem-fraction-static 0.93`, `--chunked-prefill-size 4096`, no
-  `--context-length` and no `--chat-template`: all four are wrong here, in that order of
-  severity. Use `SGLANG_SPEC=dflash ./sglang_server.sh`.
+- **The fastest stack is gfx1151_optim step 7.** Quark INT4 + DFlash2 + `wvSplitK` +
+  grouped GDN + packed decode, `--chunked-prefill-size 4096`, `--mem-fraction-static 0.93`.
+  If 0.93 hangs the host, relaunch with `SGLANG_MEM_FRACTION=0.85`. The older 1024-chunk
+  advice was for the pre-wvSplitK GEMM path.
